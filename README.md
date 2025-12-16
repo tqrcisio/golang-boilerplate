@@ -1,10 +1,10 @@
 # golang-boilerplate
 
-Este é um projeto de exemplo em Go que demonstra uma implementação de árvore de busca binária.
+This is a sample Go project that demonstrates a binary search tree implementation.
 
-## Estrutura do Projeto
+## Project Structure
 
-O projeto está organizado da seguinte forma:
+The project is organized as follows:
 
 ```
 .
@@ -19,17 +19,21 @@ O projeto está organizado da seguinte forma:
 └── README.md
 ```
 
-- **`cmd/`**: Contém o ponto de entrada da aplicação principal.
-  - **`golang-boilerplate/`**: O diretório da aplicação principal.
-    - **`main.go`**: O ponto de entrada do programa. Ele cria uma árvore de busca binária e a imprime em ordem.
+- **`cmd/`**: Contains the main application's entry point.
+  - **`golang-boilerplate/`**: The main application directory.
+    - **`main.go`**: The program's entry point. It creates a binary search tree and prints it in order.
 
-- **`internal/`**: Contém pacotes internos, não destinados a serem utilizados por outras aplicações.
-  - **`tree/`**: Um pacote que implementa uma árvore de busca binária para strings.
-    - **`tree.go`**: A implementação da árvore de busca binária.
+- **`internal/`**: Contains internal packages, not intended for use by other applications.
+  - **`tree/`**: A package that implements a binary search tree for strings.
+    - **`tree.go`**: The binary search tree implementation.
 
-## Como Executar
+## How to Run
 
-Para executar o projeto, utilize o seguinte comando:
+To run the project, use the following command:
+
+```bash
+go run ./cmd/golang-boilerplate
+```
 
 ```bash
 go run ./cmd/golang-boilerplate
