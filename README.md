@@ -1,38 +1,47 @@
 # golang-boilerplate
 
-Production-ready Go boilerplate for a **Windows service** that exposes an HTTP
-API and ships with an **out-of-process auto-updater** plus **CI-driven
-releases** to GitHub Releases.
+A Go HTTP service that runs as a Windows service and updates itself. Two
+binaries sit next to each other on the host: `server.exe` polls GitHub
+Releases for new versions, `updater.exe` handles the file swap and service
+restart. Releases are tagged automatically from conventional commits on
+`main`.
 
-Fork this when you need a long-running Go agent that runs on customer machines
-and updates itself without manual intervention.
+Starting point for long-running Go agents that ship to customer machines and
+need to stay current without someone RDP'ing in once a month.
 
-## What you get
+## Architecture
 
-- **`server.exe`** — the Windows service. HTTP API, API-key auth, gzip,
-  CORS, structured `/health`.
-- **`updater.exe`** — sibling binary that owns the actual update apply: stops
-  the service, swaps binaries on disk, restarts, polls `/health` for the new
-  version, and rolls back to `.old` files on failure.
-- **`internal/applier/`** — pure state machine for the swap/rollback flow.
-- **`internal/updater/`** — manifest polling, integrity-checked download
-  staging, nightly window enforcement, on-demand `POST /update` handler.
-- **GitHub Actions release workflow** — pushes to `main` trigger
-  [`go-semantic-release`](https://github.com/go-semantic-release/action), which
-  computes the next version, tags it, builds both binaries, generates
-  `manifest.json`, and uploads everything as release assets.
-- **Cross-platform builds** — the service wrapper falls back to foreground
-  mode on macOS/Linux so you can iterate locally without a real SCM.
+```mermaid
+flowchart LR
+    subgraph host["Customer Windows host (C:\golang-boilerplate)"]
+        direction TB
+        svc["server.exe<br/>HTTP :7000<br/>SCM-managed"]
+        upd["updater.exe<br/>spawned on apply"]
+        stage[(".update/&lt;version&gt;/<br/>staged downloads")]
+        live[("server.exe.old<br/>updater.exe.old<br/>status.json")]
+        svc -- "hourly poll + verify" --> stage
+        svc -- "POST /update<br/>or 02:00-05:00 window" --> upd
+        upd -- "sc stop / sc start" --> svc
+        upd -- "rename + copy" --> live
+        upd -- "writes" --> live
+    end
+    subgraph gh["GitHub Releases"]
+        direction TB
+        man["manifest.json<br/>(latest/download redirect)"]
+        bin["server.exe + updater.exe<br/>+ .sha256 sidecars"]
+    end
+    svc -. "GET manifest.json" .-> man
+    svc -. "GET assets + verify sha256" .-> bin
+```
 
-## Why this shape
+Why the split: Windows won't let a service stop itself and overwrite its own
+running binary in the same step. `server.exe` handles the safe parts (poll,
+download, checksum, hand off), and `updater.exe` runs detached to do the
+risky parts (SCM stop, rename, copy, restart, poll health). If the new
+binary fails its health check, `updater.exe` puts the `.old` files back and
+records the rollback in `status.json` so the next boot can surface it.
 
-Out-of-process updates are the reliable pattern for self-updating Windows
-services. A service cannot `sc stop` itself and then swap its own running
-binary, so an external `updater.exe` does the dance. The split keeps
-`server.exe` simple (poll + download + verify + handoff) and isolates the
-risky filesystem/SCM steps in a helper that can be replaced independently.
-
-## Project structure
+## Layout
 
 ```
 .
@@ -40,7 +49,7 @@ risky filesystem/SCM steps in a helper that can be replaced independently.
 │   ├── server/main.go        # service entry point
 │   └── updater/main.go       # update helper entry point
 ├── internal/
-│   ├── applier/              # stop/swap/start/poll/rollback state machine
+│   ├── applier/              # stop, swap, start, poll, rollback
 │   ├── config/               # config.json loader (next to the binary)
 │   ├── server/               # HTTP server, middleware, handlers
 │   ├── service/              # kardianos/service wrapper, SCM recovery
@@ -51,12 +60,10 @@ risky filesystem/SCM steps in a helper that can be replaced independently.
 └── README.md
 ```
 
-## Quick start
-
-### Build
+## Build
 
 ```bash
-# Cross-compile for the production target
+# Production target
 GOOS=windows GOARCH=amd64 go build -o server.exe  ./cmd/server
 GOOS=windows GOARCH=amd64 go build -o updater.exe ./cmd/updater
 
@@ -64,11 +71,15 @@ GOOS=windows GOARCH=amd64 go build -o updater.exe ./cmd/updater
 go build ./...
 ```
 
-### Run locally (macOS / Linux)
+CI bakes the version into the binary with `-ldflags "-X main.version=v0.1.0"`;
+without that flag the binary identifies as `dev` and the updater stays
+silent.
 
-`go run` puts the compiled binary in a temp dir, so the config lookup that
-expects `config.json` next to the binary won't find it. Point
-`BOILERPLATE_CONFIG` at the file explicitly:
+## Run locally (macOS / Linux)
+
+`go run` puts the compiled binary in a temp dir, so the loader that looks
+for `config.json` beside the executable comes up empty. Point it at the
+file directly:
 
 ```bash
 cp config.example.json config.json
@@ -76,32 +87,28 @@ BOILERPLATE_CONFIG=$(pwd)/config.json go run ./cmd/server -action run
 curl localhost:7000/health
 ```
 
-The service wrapper falls back to foreground mode outside Windows; `Ctrl+C`
-stops it. Logs go to stdout.
+Outside Windows the service wrapper drops to foreground mode; `Ctrl+C`
+stops it, logs go to stdout.
 
-### Install on Windows (production)
+## Install on Windows
 
-1. Build both binaries with an ldflag version stamp (CI does this for you):
-   ```bash
-   go build -ldflags "-X main.version=v0.1.0" -o server.exe  ./cmd/server
-   go build -ldflags "-X main.version=v0.1.0" -o updater.exe ./cmd/updater
-   ```
-2. Drop `server.exe`, `updater.exe`, and `config.json` next to each other
-   (e.g. `C:\golang-boilerplate\`).
+1. Build both binaries with a real version stamp (CI does this; see above).
+2. Drop `server.exe`, `updater.exe`, and `config.json` next to each other,
+   e.g. `C:\golang-boilerplate\`.
 3. Register and start:
    ```cmd
    server.exe -action install
    server.exe -action start
    ```
-4. Other actions: `stop`, `uninstall`, `run` (foreground).
 
-`server.exe -action install` also configures Windows Service Recovery actions
-to restart the service three times with a 10-second delay between attempts.
+`install` also runs `sc.exe failure` to set up Recovery Actions: three
+restarts, 10 seconds apart. Other actions: `stop`, `uninstall`, `run`
+(foreground for debugging).
 
 ## Configuration
 
-`config.json` lives next to the binary on Windows. On dev machines set
-`BOILERPLATE_CONFIG` to point at it.
+`config.json` lives beside the binary on Windows. On dev machines, point
+`BOILERPLATE_CONFIG` at it.
 
 ```json
 {
@@ -111,80 +118,95 @@ to restart the service three times with a 10-second delay between attempts.
 }
 ```
 
-| Field                 | Default      | Notes                                                          |
-| --------------------- | ------------ | -------------------------------------------------------------- |
-| `port`                | `7000`       | HTTP listen port.                                              |
-| `api_key`             | `change-me`  | Required in `X-API-Key` header (or `?api_key=` query) on auth-gated routes. |
-| `auto_update_enabled` | `true`       | Kill switch for the updater poll loop. Absent means default-on. |
+| Field                 | Default     | Notes                                                                       |
+| --------------------- | ----------- | --------------------------------------------------------------------------- |
+| `port`                | `7000`      | HTTP listen port.                                                           |
+| `api_key`             | `change-me` | Required in `X-API-Key` header (or `?api_key=` query) on auth-gated routes. |
+| `auto_update_enabled` | `true`      | Kill switch for the updater poll loop. Absent means default-on.             |
 
 ## HTTP endpoints
 
-| Method | Path      | Auth     | Description                                                                 |
-| ------ | --------- | -------- | --------------------------------------------------------------------------- |
-| `GET`  | `/health` | none     | `{ version, auto_update_enabled, started_at, uptime, last_poll_at, last_update }`. Used by the updater to confirm the new binary booted. |
-| `GET`  | `/hello`  | API key  | Example handler returning `{ message, version }`.                            |
-| `POST` | `/update` | API key  | Forces an immediate poll + apply (skips the nightly window).                 |
-| `POST` | `/config` | API key  | Replaces `config.json` and reloads (port change requires a service restart). |
+| Method | Path      | Auth    | Description                                                                                                                              |
+| ------ | --------- | ------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| `GET`  | `/health` | none    | `{ version, auto_update_enabled, started_at, uptime, last_poll_at, last_update }`. The updater uses this to confirm the new binary booted. |
+| `GET`  | `/hello`  | API key | Example handler. Returns `{ message, version }`.                                                                                          |
+| `POST` | `/update` | API key | Forces an immediate poll and apply, ignoring the nightly window.                                                                          |
+| `POST` | `/config` | API key | Replaces `config.json` and reloads. Port changes need a service restart.                                                                  |
 
-## Auto-update
+## Update flow
 
-`server.exe` polls the configured manifest URL hourly. When a newer version
-is available, it downloads `server.exe` + `updater.exe` (and their sha256
-sidecars) into `<exeDir>/.update/<version>/`, verifies integrity, and waits
-for the nightly window **02:00-05:00 local time** before handing off to
-`updater.exe`. The kill switch (`auto_update_enabled: false`) pauses polling
-without redeploying. `POST /update` runs the same flow immediately.
+```mermaid
+sequenceDiagram
+    participant S as server.exe
+    participant GH as GitHub Releases
+    participant U as updater.exe
+    participant FS as Disk
 
-### Flow
+    loop every hour
+        S->>GH: GET manifest.json
+        GH-->>S: { version, urls, sha256 urls }
+        alt newer version
+            S->>GH: GET server.exe / updater.exe + .sha256
+            S->>FS: write to .update/{version}/, verify checksums
+        end
+    end
+    Note over S: wait for 02:00-05:00 window<br/>(or POST /update)
+    S->>U: spawn detached with --new-exe, --new-updater
+    U->>S: sc.exe stop (SCM kills server.exe)
+    U->>FS: rename live -> .old, copy staged -> live
+    U->>S: sc.exe start
+    U->>S: GET /health (up to 60s)
+    alt health reports new version
+        U->>FS: delete .old, write status.json: ok
+    else timeout or wrong version
+        U->>FS: restore .old, mark binary as .failed-{version}
+        U->>S: sc.exe start (rollback)
+        U->>FS: write status.json: rolled_back
+    end
+```
 
-1. Hourly: `server.exe` does `GET <manifest-url>` (default points at this
-   repo's latest GitHub release).
-2. If the embedded `version` (set via `-X main.version=...` at build time) is
-   older, the new `server.exe` + `updater.exe` + sha256 files land in
-   `<exeDir>/.update/<version>/` and get checksum-verified.
-3. Inside the window (or on `POST /update`), `server.exe` spawns the staged
-   `updater.exe` detached and lets the SCM stop it.
-4. `updater.exe`:
-   - `sc stop <service>` (idempotent),
-   - renames the live binaries to `*.old` and copies the new ones in,
-   - writes a sentinel file with TTL,
-   - `sc start <service>`,
-   - polls `GET /health` for up to 60 s waiting for
-     `version == toVersion`,
-   - on success: cleans up `.old`, writes `status.json: ok`;
-   - on failure: restores `.old` to live names, renames the bad binary to
-     `*.failed-<version>`, restarts, writes `status.json: rolled_back`.
+A few extra rules worth knowing:
 
-### Configuring the manifest source
+- `dev` builds (no version ldflag) never poll. Set the ldflag if you want
+  to exercise the path locally.
+- If the host is running an older `server.exe` that predates this pattern,
+  it bootstraps a matching `updater.exe` from the corresponding release
+  asset on first boot. Auto-update stays paused until that lands.
+- Stage dirs for the version that has already been applied get pruned on
+  the next boot. `updater.exe` can't delete its own running file, so the
+  cleanup waits for the next `server.exe` start.
 
-The default manifest URL is:
+## Pointing the updater at a different repo
+
+By default the manifest URL is
 
 ```
 https://github.com/tqrcisio/golang-boilerplate/releases/latest/download/manifest.json
 ```
 
-In a fork, override either at build time or via env var:
+For your fork, override it at build time (preferred, because the value
+gets baked into the binary):
 
 ```bash
-# Build-time (best — bakes the value into the binary)
 go build -ldflags \
   "-X main.version=v0.1.0 \
    -X github.com/tqrcisio/golang-boilerplate/internal/updater.DefaultReleaseRepo=youruser/yourrepo" \
   -o server.exe ./cmd/server
+```
 
-# Runtime override (handy for staging)
-BOILERPLATE_RELEASE_REPO=youruser/yourrepo server.exe -action run
+Or, for a one-off (staging, testing, switching repos at runtime):
 
-# Or point at any other manifest entirely
+```bash
+BOILERPLATE_RELEASE_REPO=youruser/yourrepo  server.exe -action run
 BOILERPLATE_MANIFEST_URL=https://example.com/manifest.json server.exe -action run
 ```
 
-`manifest.json` shape (CI generates this):
+`manifest.json` shape (CI generates this file on every release):
 
 ```json
 {
-  "version": "v0.1.0",
-  "released_at": "2026-05-18T00:00:00Z",
+  "version":              "v0.1.0",
+  "released_at":          "2026-05-18T00:00:00Z",
   "download_url":         "https://github.com/owner/repo/releases/download/v0.1.0/server.exe",
   "sha256_url":           "https://github.com/owner/repo/releases/download/v0.1.0/server.exe.sha256",
   "updater_download_url": "https://github.com/owner/repo/releases/download/v0.1.0/updater.exe",
@@ -192,57 +214,47 @@ BOILERPLATE_MANIFEST_URL=https://example.com/manifest.json server.exe -action ru
 }
 ```
 
-### Dev builds skip auto-update
+## Release pipeline
 
-Builds without the ldflag default to `version = "dev"` and never poll. Set the
-ldflag whenever you want to exercise the update path locally.
+```mermaid
+flowchart LR
+    push["push to main<br/>(conventional commit)"]
+    semrel["go-semantic-release<br/>tag + release notes"]
+    build["go build -ldflags<br/>server.exe + updater.exe"]
+    sums["sha256 sidecars"]
+    manifest["manifest.json"]
+    upload["gh release upload"]
+    poll[("server.exe on host<br/>picks it up next hour")]
 
-### First-time installs without `updater.exe`
-
-If a host is running an old `server.exe` that predates this pattern, it will
-download a matching `updater.exe` for its own version from the releases
-endpoint on first boot. Auto-update stays paused until that succeeds.
-
-## Releasing
-
-Pushes to `main` trigger the release workflow:
-
-1. `go-semantic-release` reads conventional commits since the last tag,
-   computes the next version, creates the tag, and writes release notes.
-2. The workflow builds `server.exe` + `updater.exe` with the version embedded
-   via `-ldflags "-X main.version=v$VERSION"`.
-3. SHA256 sidecars and `manifest.json` are generated.
-4. All five files (`server.exe`, `server.exe.sha256`, `updater.exe`,
-   `updater.exe.sha256`, `manifest.json`) plus `config.example.json` are
-   uploaded as release assets.
-5. The release body is rewritten with stable download links.
-
-Because GitHub redirects `releases/latest/download/<asset>` to the actual
-latest release, the manifest URL stays stable across releases — no extra
-hosting needed.
-
-### Commit conventions
-
-```
-feat:     new user-facing feature  → minor bump
-fix:      bug fix                  → patch bump
-feat!:    breaking change          → major bump
-chore:    no release
-docs:     no release
-refactor: no release
+    push --> semrel --> build --> sums --> manifest --> upload --> poll
 ```
 
-### Cutting the first release
+GitHub redirects `releases/latest/download/<asset>` to the actual latest
+release, so the manifest URL is stable across versions and there's no
+secondary bucket to keep alive.
 
-Push at least one `feat:` or `fix:` commit and merge to `main`. The workflow
-creates `v0.1.0` (or whatever semrel computes) and uploads the assets.
+Commit conventions used by `go-semantic-release`:
+
+```
+feat:     new feature           -> minor bump
+fix:      bug fix                -> patch bump
+feat!:    breaking change        -> major bump
+chore / docs / refactor:         no release
+```
+
+To cut the first release, push at least one `feat:` or `fix:` commit to
+`main`. The workflow tags `v0.1.0` (or whatever semrel computes) and
+uploads the assets.
 
 ## Dependencies
 
-- [`github.com/kardianos/service`](https://github.com/kardianos/service) — cross-platform service wrapper (SCM on Windows, foreground elsewhere).
-- [`github.com/kardianos/osext`](https://github.com/kardianos/osext) — resolves the directory of the running executable.
+- [`github.com/kardianos/service`](https://github.com/kardianos/service)
+  for the cross-platform service wrapper (SCM on Windows, foreground
+  everywhere else).
+- [`github.com/kardianos/osext`](https://github.com/kardianos/osext) for
+  resolving the directory the running executable lives in.
 
-Both are pure Go and CGO-free. Builds happily on `ubuntu-latest` runners.
+Both are pure Go and CGO-free, which keeps the CI runner simple.
 
 ## License
 
